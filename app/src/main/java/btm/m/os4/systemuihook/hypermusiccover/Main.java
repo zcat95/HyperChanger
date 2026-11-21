@@ -8090,22 +8090,59 @@ public class Main extends XposedModule {
      * "is this the notification centre" has an answer: the finished tree with the shade open.
      * See setCardBlurActive().
      */
-    private static final java.util.Map<View, View> sCandidates =
-            java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<View, View>());
+    /**
+     * Weak on purpose. The previous identity map retained every prepared element and, through
+     * the row value, the notification subtree, until the map passed 512 and was cleared whole.
+     * Detach removes the entry now. A view SystemUI itself still holds can be recorded again
+     * when it is attached; one that has been dropped can be collected.
+     */
+    private static final CardCandidateTable<View, View> sCandidateTable = new CardCandidateTable<>();
+    private static final int CANDIDATE_WATCH = View.generateViewId();
+    private static final int WRITTEN_WATCH = View.generateViewId();
 
     private static void noteCandidate(View v, View row) {
-        synchronized (sCandidates) {
-            if (sCandidates.size() > 512) {
-                sCandidates.clear();
-                Xp.log(TAG + "card elements: candidate set overflowed, cleared");
-            }
-            if (!sCandidates.containsKey(v)) sCandidates.put(v, row);
-        }
+        if (v == null) return;
+        CandidateWatch.arm(v, row);
+        if (v.isAttachedToWindow()) sCandidateTable.note(v, row);
+        else sCandidateTable.forget(v);
         // A row prepared while the notification centre is ALREADY up never sees the rising edge,
         // and would sit there sampling the app behind the shade until the next pull-down. The
         // sweep is idempotent and the candidate list is small, so asking again is the cheap half
-        // of that trade.
+        // of that trade. The switch still has to be on; recording a candidate does not start it.
         if (sCardBlurActive) setCardBlurActive(true, false);
+    }
+
+    /**
+     * The listener lives on the view, not in a static map. Detach drops our candidate and any
+     * blur snapshot. The keyguard and the shade share one attached tree, so closing the shade
+     * does not take this path.
+     */
+    private static final class CandidateWatch implements View.OnAttachStateChangeListener {
+        private java.lang.ref.WeakReference<View> row;
+
+        static void arm(View element, View row) {
+            final Object tag = element.getTag(CANDIDATE_WATCH);
+            final CandidateWatch watch = tag instanceof CandidateWatch
+                    ? (CandidateWatch) tag : new CandidateWatch();
+            if (tag != watch) {
+                element.setTag(CANDIDATE_WATCH, watch);
+                element.addOnAttachStateChangeListener(watch);
+            }
+            watch.row = row == null ? null : new java.lang.ref.WeakReference<>(row);
+        }
+
+        @Override
+        public void onViewAttachedToWindow(View v) {
+            final View row = this.row == null ? null : this.row.get();
+            sCandidateTable.note(v, row);
+            if (sCardBlurActive) setCardBlurActive(true, false);
+        }
+
+        @Override
+        public void onViewDetachedFromWindow(View v) {
+            sCandidateTable.forget(v);
+            releaseWritten(v);
+        }
     }
 
     /**
@@ -8151,13 +8188,13 @@ public class Main extends XposedModule {
                         Xp.log(TAG + "card blur on: switch is off, nothing written");
                         return;
                     }
-                    final java.util.List<View> vs;
-                    synchronized (sCandidates) {
-                        vs = new java.util.ArrayList<>(sCandidates.keySet());
-                    }
-                    int applied = 0, gone = 0, other = 0;
+                    pruneDetachedWritten();
+                    final CardCandidateTable.Snapshot<View, View> snap =
+                            sCandidateTable.snapshotAttached(View::isAttachedToWindow);
+                    final java.util.List<CardCandidateTable.Hit<View, View>> vs = snap.attached;
+                    int applied = 0, gone = snap.dropped, other = 0;
                     for (int i = 0; i < vs.size(); i++) {
-                        final View v = vs.get(i);
+                        final View v = vs.get(i).element;
                         // No position test here, and its absence is a measurement, not a
                         // simplification. It was "under NotificationPanelView", it rejected EVERY
                         // card on this build, and the ancestry probe says why: the notification
@@ -8186,7 +8223,7 @@ public class Main extends XposedModule {
                             continue;
                         }
                         if (sWritten.containsKey(v)) continue;
-                        final View row = sCandidates.get(v);
+                        final View row = vs.get(i).row;
                         // A row-less element is only ours if it belongs to the media card - the
                         // one card that is not a notification row, and the one the utility hands
                         // over as a bare ImageView. Everything else without a row is something
@@ -8512,6 +8549,7 @@ public class Main extends XposedModule {
         synchronized (sWritten) {
             if (!sWritten.containsKey(v)) sWritten.put(v, was);
         }
+        watchWritten(v);
         final int n = sBlurApplied.incrementAndGet();
         final String kind = v.getClass().getName() + " in "
                 + (row == null ? "?" : row.getClass().getSimpleName());
@@ -8526,12 +8564,48 @@ public class Main extends XposedModule {
     /**
      * Views the local blur has been written to, by identity, with the state each had before it.
      *
-     * Strong references, which is normally the wrong thing to hold in a system process - but
-     * this is the only record of what the system's own material was, and a view that has been
-     * forgotten is a view that cannot be put back. The rows come from a bounded recycled pool.
+     * Strong references for views that are still attached: this is the only record of the
+     * system's own material, and a view that has been forgotten cannot be put back. Detach
+     * restores that material and drops the entry, so a removed row is not kept alive here.
+     * The rows SystemUI still shows come from its own recycled pool.
      */
     private static final java.util.Map<View, int[]> sWritten =
             java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<View, int[]>());
+
+    /** Restores one view and forgets it. A second caller finds nothing left to restore. */
+    private static void releaseWritten(View v) {
+        if (v == null) return;
+        final int[] was;
+        synchronized (sWritten) {
+            was = sWritten.remove(v);
+        }
+        if (was == null) return;
+        try {
+            MiBlur.restore(v, was);
+        } catch (Throwable t) {
+            Xp.log(TAG + "card blur restore on detach failed: " + t);
+        }
+    }
+
+    private static void pruneDetachedWritten() {
+        final java.util.List<View> gone = new java.util.ArrayList<>();
+        synchronized (sWritten) {
+            for (View v : sWritten.keySet()) {
+                if (v == null || !v.isAttachedToWindow()) gone.add(v);
+            }
+        }
+        for (int i = 0; i < gone.size(); i++) releaseWritten(gone.get(i));
+    }
+
+    private static void watchWritten(View v) {
+        if (v.getTag(WRITTEN_WATCH) != null) return;
+        final View.OnAttachStateChangeListener listener = new View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(View view) { }
+            @Override public void onViewDetachedFromWindow(View view) { releaseWritten(view); }
+        };
+        v.setTag(WRITTEN_WATCH, listener);
+        v.addOnAttachStateChangeListener(listener);
+    }
     private static final java.util.Set<String> sBlurAppliedKinds =
             java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
 
@@ -8756,10 +8830,8 @@ public class Main extends XposedModule {
 
     /** Every element the system has offered us, whether we wrote to it, and what it is. */
     private static void dumpCandidates() {
-        final java.util.List<View> vs;
-        synchronized (sCandidates) {
-            vs = new java.util.ArrayList<>(sCandidates.keySet());
-        }
+        final java.util.List<CardCandidateTable.Hit<View, View>> vs =
+                sCandidateTable.snapshotAttached(View::isAttachedToWindow).attached;
         main().post(new Runnable() {
             @Override
             public void run() {
@@ -8767,8 +8839,8 @@ public class Main extends XposedModule {
                     Xp.log(TAG + "cand: " + vs.size() + " elements, written=" + sWritten.size()
                             + ", cardBlurOn=" + ShadeLayer.cardBlurOn());
                     for (int i = 0; i < vs.size(); i++) {
-                        final View v = vs.get(i);
-                        final View row = sCandidates.get(v);
+                        final View v = vs.get(i).element;
+                        final View row = vs.get(i).row;
                         final int[] loc = new int[2];
                         v.getLocationOnScreen(loc);
                         Xp.log(TAG + "cand " + (sWritten.containsKey(v) ? "*" : " ")
@@ -8784,7 +8856,7 @@ public class Main extends XposedModule {
                                 + " " + MiBlur.describe(v));
                         Xp.log(TAG + "  anc=" + ancestry(v));
                     }
-                    if (!vs.isEmpty()) dumpMediaCard(vs.get(0).getRootView());
+                    if (!vs.isEmpty()) dumpMediaCard(vs.get(0).element.getRootView());
                 } catch (Throwable t) {
                     Xp.log(TAG + "cand probe failed: " + t);
                 }

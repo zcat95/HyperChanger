@@ -5408,8 +5408,9 @@ class HyperSystemUiModule : XposedModule() {
                             applyNormalNotificationRowEffect(row, context, classLoader, effectClass.simpleName)
                             // Some keyguard transitions finish their effect transaction after
                             // apply() returns. Re-apply on the next frame so that the focus
-                            // effect cannot leave its darker keyguard glass behind.
-                            row.post {
+                            // effect cannot leave its darker keyguard glass behind. A detached
+                            // row would keep that callback in its HandlerActionQueue.
+                            if (row.isAttachedToWindow) row.post {
                                 if (preferences.getBoolean(KEY_UNIFY_NOTIFICATION_MATERIAL, false) &&
                                     isFocusNotificationRow(row)
                                 ) {
@@ -5485,7 +5486,7 @@ class HyperSystemUiModule : XposedModule() {
                                     classLoader,
                                     effectClass.simpleName,
                                 )
-                                header.post {
+                                if (header.isAttachedToWindow) header.post {
                                     if (preferences.getBoolean(KEY_UNIFY_NOTIFICATION_MATERIAL, false) &&
                                         isMediaNotificationView(header)
                                     ) {
