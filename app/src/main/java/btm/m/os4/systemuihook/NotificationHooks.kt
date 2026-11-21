@@ -16,6 +16,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.widget.TextView
+import java.util.IdentityHashMap
 import android.widget.Toast
 import io.github.libxposed.api.XposedInterface.ExceptionMode
 import java.lang.reflect.Field
@@ -267,6 +268,10 @@ internal class NotificationHooks(
     private data class TextColors(val original: ColorStateList, val applied: ColorStateList)
     private val textRoots = Collections.synchronizedMap(WeakHashMap<View, TextRoot>())
     private val textColors = Collections.synchronizedMap(WeakHashMap<TextView, TextColors>())
+    private val refreshLedger = NotificationRefreshLedger<View>()
+    private val pendingRefresh = Collections.synchronizedMap(IdentityHashMap<View, Runnable>())
+    private val followUps = Collections.synchronizedMap(IdentityHashMap<View, Runnable>())
+    private val appearanceTag = View.generateViewId()
     private var textHooksInstalled = false
     private var textPreferenceListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
     @Volatile private var darkIntensity = 0f
@@ -278,6 +283,9 @@ internal class NotificationHooks(
     )
     private val stackBlurBaselines = Collections.synchronizedMap(WeakHashMap<View, ViewRenderBaseline>())
     private val stackBlurProgress = Collections.synchronizedMap(WeakHashMap<View, Float>())
+    private val stackBlurLedger = NotificationRefreshLedger<View>()
+    private val stackBlurTasks = Collections.synchronizedMap(IdentityHashMap<View, Runnable>())
+    private val stackBlurTag = View.generateViewId()
     private val stackBlurEffects = java.util.concurrent.ConcurrentHashMap<Int, RenderEffect>()
     private data class StackRadiusAccessor(val method: java.lang.reflect.Method?)
     private val stackRadiusAccessors = object : ClassValue<StackRadiusAccessor>() {
@@ -357,13 +365,102 @@ internal class NotificationHooks(
         val row = (readInstanceField(wrapper, "mRow") as? View) ?: rowHint ?:
             generateSequence(root.parent as? View) { it.parent as? View }
                 .firstOrNull { it.javaClass.name.endsWith(".ExpandableNotificationRow") }
-        textRoots[root] = TextRoot(WeakReference(wrapper), WeakReference(row))
+        val watch = appearanceWatch(root, preferences)
+        watch.wrapper = WeakReference(wrapper)
+        watch.row = WeakReference(row)
+        if (!root.isAttachedToWindow) {
+            cancelAppearance(root)
+            refreshLedger.detach(root)
+            textRoots.remove(root)
+            return
+        }
+        textRoots[root] = TextRoot(watch.wrapper!!, watch.row!!)
+        refreshLedger.track(root)
         applyText(root, preferences)
+    }
+
+    private fun appearanceWatch(root: View, preferences: SharedPreferences): AppearanceWatch {
+        val existing = root.getTag(appearanceTag) as? AppearanceWatch
+        if (existing != null) return existing
+        val watch = AppearanceWatch(preferences)
+        root.setTag(appearanceTag, watch)
+        root.addOnAttachStateChangeListener(watch)
+        return watch
+    }
+
+    private fun cancelAppearance(root: View) {
+        pendingRefresh.remove(root)?.let { root.removeCallbacks(it) }
+        followUps.remove(root)?.let { root.removeCallbacks(it) }
+    }
+
+    private fun enqueueAppearance(root: View, preferences: SharedPreferences) {
+        if (!root.isAttachedToWindow) {
+            cancelAppearance(root)
+            refreshLedger.finish(root)
+            return
+        }
+        pendingRefresh.remove(root)?.let { root.removeCallbacks(it) }
+        lateinit var task: Runnable
+        task = Runnable {
+            if (pendingRefresh[root] !== task) return@Runnable
+            pendingRefresh.remove(root)
+            refreshLedger.finish(root)
+            if (!root.isAttachedToWindow || textRoots[root] == null) return@Runnable
+            applyText(root, preferences)
+        }
+        pendingRefresh[root] = task
+        if (!root.post(task)) {
+            if (pendingRefresh[root] === task) pendingRefresh.remove(root)
+            refreshLedger.finish(root)
+        }
+    }
+
+    private fun enqueueFollowUp(root: View, wrapper: Any, row: View?, preferences: SharedPreferences) {
+        if (!root.isAttachedToWindow) {
+            followUps.remove(root)?.let { root.removeCallbacks(it) }
+            return
+        }
+        followUps.remove(root)?.let { root.removeCallbacks(it) }
+        lateinit var task: Runnable
+        task = Runnable {
+            if (followUps[root] !== task) return@Runnable
+            followUps.remove(root)
+            if (!root.isAttachedToWindow) return@Runnable
+            trackWrapper(wrapper, row, preferences)
+        }
+        followUps[root] = task
+        if (!root.post(task) && followUps[root] === task) followUps.remove(root)
     }
 
     private fun refreshText(preferences: SharedPreferences) {
         val roots = synchronized(textRoots) { textRoots.keys.toList() }
-        roots.forEach { root -> root.post { applyText(root, preferences) } }
+        val plan = refreshLedger.planRefresh(roots) { it.isAttachedToWindow }
+        plan.dropped.forEach { root ->
+            cancelAppearance(root)
+            textRoots.remove(root)
+        }
+        plan.refresh.forEach { root -> enqueueAppearance(root, preferences) }
+    }
+
+    private inner class AppearanceWatch(
+        private val preferences: SharedPreferences,
+    ) : View.OnAttachStateChangeListener {
+        var wrapper: WeakReference<Any>? = null
+        var row: WeakReference<View>? = null
+
+        override fun onViewAttachedToWindow(v: View) {
+            val wrapper = wrapper ?: return
+            if (wrapper.get() == null) return
+            textRoots[v] = TextRoot(wrapper, row ?: WeakReference(null))
+            refreshLedger.onAttached(v)
+            applyText(v, preferences)
+        }
+
+        override fun onViewDetachedFromWindow(v: View) {
+            cancelAppearance(v)
+            refreshLedger.detach(v)
+            textRoots.remove(v)
+        }
     }
 
     fun installNotificationTextHooks(classLoader: ClassLoader, preferences: SharedPreferences) {
@@ -398,8 +495,9 @@ internal class NotificationHooks(
                                 val row = (0 until method.parameterCount).map { chain.getArg(it) }
                                     .firstOrNull { it is View && it.javaClass.name.endsWith(".ExpandableNotificationRow") } as? View
                                 trackWrapper(owner, row, preferences)
-                                // MIUI also posts template work after onContentUpdated.
-                                root?.post { trackWrapper(owner, row, preferences) }
+                                // MIUI also posts template work after onContentUpdated. One follow-up
+                                // replaces any previous one, and a detached root is not queued.
+                                if (root != null) enqueueFollowUp(root, owner, row, preferences)
                             }
                             result
                         }
@@ -462,7 +560,21 @@ internal class NotificationHooks(
         }
     }
 
+    private fun watchStackBlur(view: View) {
+        if (view.getTag(stackBlurTag) != null) return
+        val listener = object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) = Unit
+            override fun onViewDetachedFromWindow(v: View) {
+                stackBlurTasks.remove(v)?.let { v.removeCallbacks(it) }
+                stackBlurLedger.detach(v)
+            }
+        }
+        view.setTag(stackBlurTag, listener)
+        view.addOnAttachStateChangeListener(listener)
+    }
+
     private fun applyStackBlur(view: View, progress: Float, settings: NotificationStackBlurSettings) {
+        watchStackBlur(view)
         stackBlurProgress[view] = progress
         val enabled = settings.enabled
         if (!enabled) {
@@ -537,9 +649,26 @@ internal class NotificationHooks(
             if (key == null || key == KEY_NOTIFICATION_STACK_BLUR || key == KEY_NOTIFICATION_STACK_BLUR_OFFSET) {
                 val settings = readNotificationStackBlurSettings(preferences)
                 val tracked = synchronized(stackBlurBaselines) { stackBlurBaselines.keys.toList() }
-                tracked.forEach { view ->
-                    val progress = stackBlurProgress[view] ?: 0f
-                    view.post { applyStackBlur(view, progress, settings) }
+                val plan = stackBlurLedger.planRefresh(tracked) { it.isAttachedToWindow }
+                plan.dropped.forEach { view ->
+                    stackBlurTasks.remove(view)?.let { view.removeCallbacks(it) }
+                }
+                plan.refresh.forEach { view ->
+                    stackBlurTasks.remove(view)?.let { view.removeCallbacks(it) }
+                    lateinit var task: Runnable
+                    task = Runnable {
+                        if (stackBlurTasks[view] !== task) return@Runnable
+                        stackBlurTasks.remove(view)
+                        stackBlurLedger.finish(view)
+                        if (!view.isAttachedToWindow) return@Runnable
+                        val progress = stackBlurProgress[view] ?: 0f
+                        applyStackBlur(view, progress, settings)
+                    }
+                    stackBlurTasks[view] = task
+                    if (!view.post(task) && stackBlurTasks[view] === task) {
+                        stackBlurTasks.remove(view)
+                        stackBlurLedger.finish(view)
+                    }
                 }
             }
         }.also(preferences::registerOnSharedPreferenceChangeListener)
